@@ -15,7 +15,6 @@
 
 'use strict';
 
-const async = require('async');
 const fs = require('fs');
 const path = require('path');
 
@@ -58,7 +57,7 @@ Index.prototype.quit = function() {
   this.docsClient.quit();
 };
 
-Index.prototype.add = function(filename, document, callback) {
+Index.prototype.add = async (filename, document) => {
   const self = this;
   const PUNCTUATION = ['.', ',', ':', ''];
   const tokenizer = new natural.WordTokenizer();
@@ -78,10 +77,10 @@ Index.prototype.add = function(filename, document, callback) {
     self.tokenClient.set(filename, document, cb);
   });
 
-  async.parallel(tasks, callback);
+  return Promise.all(tasks);
 };
 
-Index.prototype.lookup = function(words, callback) {
+Index.prototype.lookup = async words => {
   const self = this;
   const tasks = words.map(function(word) {
     word = word.toLowerCase();
@@ -89,7 +88,7 @@ Index.prototype.lookup = function(words, callback) {
       self.tokenClient.smembers(word, cb);
     };
   });
-  async.parallel(tasks, callback);
+  return Promise.all(tasks);
 };
 
 Index.prototype.documentIsProcessed = function(filename, callback) {
@@ -146,120 +145,70 @@ function extractDescriptions(filename, index, response, callback) {
   }
 }
 
-function getTextFromFiles(index, inputFiles, callback) {
+async function getTextFromFiles(index, inputFiles) {
   // Make a call to the Vision API to detect text
-  const requests = [];
-  inputFiles.forEach(filename => {
-    const request = {
+  const requests = inputFiles.map(filename => {
+    return {
       image: {content: fs.readFileSync(filename).toString('base64')},
       features: [{type: 'TEXT_DETECTION'}],
     };
-    requests.push(request);
   });
-  client
-    .batchAnnotateImages({requests: requests})
-    .then(results => {
-      const detections = results[0].responses;
-      const textResponse = {};
-      const tasks = [];
-      inputFiles.forEach(function(filename, i) {
-        const response = detections[i];
-        if (response.error) {
-          console.log('API Error for ' + filename, response.error);
-          return;
-        } else if (Array.isArray(response)) {
-          textResponse[filename] = 1;
-        } else {
-          textResponse[filename] = 0;
-        }
-        tasks.push(function(cb) {
-          extractDescriptions(filename, index, response, cb);
-        });
-      });
-      async.parallel(tasks, function(err) {
-        if (err) {
-          return callback(err);
-        }
-        callback(null, textResponse);
-      });
-    })
-    .catch(callback);
+  const [results] = await client.batchAnnotateImages({requests: requests});
+  const detections = results[0].responses;
+  const textResponse = {};
+  const tasks = inputFiles.map((filename, i) => {
+    const response = detections[i];
+    if (response.error) {
+      console.log('API Error for ' + filename, response.error);
+      return;
+    } else if (Array.isArray(response)) {
+      textResponse[filename] = 1;
+    } else {
+      textResponse[filename] = 0;
+    }
+    return cb => extractDescriptions(filename, index, response, cb);
+  });
+  return Promise.all(tasks);
 }
 
 // Run the example
-function main(inputDir) {
-  return new Promise((resolve, reject) => {
-    const index = new Index();
-
-    async.waterfall(
-      [
-        // Scan the specified directory for files
-        function(cb) {
-          fs.readdir(inputDir, cb);
-        },
-        // Separate directories from files
-        function(files, cb) {
-          async.parallel(
-            files.map(function(file) {
-              const filename = path.join(inputDir, file);
-              return function(cb) {
-                fs.stat(filename, function(err, stats) {
-                  if (err) {
-                    return cb(err);
-                  }
-                  if (!stats.isDirectory()) {
-                    return cb(null, filename);
-                  }
-                  cb();
-                });
-              };
-            }),
-            cb
-          );
-        },
-        // Figure out which files have already been processed
-        function(allImageFiles, cb) {
-          const tasks = allImageFiles
-            .filter(function(filename) {
-              return filename;
-            })
-            .map(function(filename) {
-              return function(cb) {
-                index.documentIsProcessed(filename, function(err, processed) {
-                  if (err) {
-                    return cb(err);
-                  }
-                  if (!processed) {
-                    // Forward this filename on for further processing
-                    return cb(null, filename);
-                  }
-                  cb();
-                });
-              };
-            });
-          async.parallel(tasks, cb);
-        },
-        // Analyze any remaining unprocessed files
-        function(imageFilesToProcess, cb) {
-          imageFilesToProcess = imageFilesToProcess.filter(function(filename) {
-            return filename;
-          });
-          if (imageFilesToProcess.length) {
-            return getTextFromFiles(index, imageFilesToProcess, cb);
-          }
-          console.log('All files processed!');
-          cb();
-        },
-      ],
-      function(err, result) {
-        index.quit();
-        if (err) {
-          return reject(err);
-        }
-        resolve(result);
-      }
-    );
+async function main(inputDir) {
+  const index = new Index();
+  // Scan the specified directory for files
+  const files = fs.readdirSync(inputDir);
+  // Separate directories from files
+  const allImageFiles = files.map(file => {
+    const filename = path.join(inputDir, file);
+    if (!fs.statSync(filename).isDirectory()) {
+      return filename;
+    }
   });
+  // Figure out which files have already been processed
+  const tasks = allImageFiles
+    .filter(filename => filename)
+    .map(filename => {
+      return cb => {
+        index.documentIsProcessed(filename, function(err, processed) {
+          if (err) {
+            return cb(err);
+          }
+          if (!processed) {
+            // Forward this filename on for further processing
+            return cb(null, filename);
+          }
+          cb();
+        });
+      };
+    });
+  // Analyze any remaining unprocessed files
+  const imageFilesToProcess = await Promise.all(tasks).filter(
+    filename => filename
+  );
+  if (imageFilesToProcess.length) {
+    return getTextFromFiles(index, imageFilesToProcess);
+  }
+  console.log('All files processed!');
+  return Promise.resolve();
 }
 
 if (module === require.main) {
